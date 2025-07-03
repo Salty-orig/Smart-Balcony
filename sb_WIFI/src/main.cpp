@@ -28,6 +28,10 @@
 #define PIN_PUMP_TOMATO_2 13
 #define PIN_PUMP_CUCUMBER 12
 
+#define sensor_pin_1 34
+#define sensor_pin_1 35
+#define sensor_pin_1 36
+
 #define smart 1
 #define automatic 0
 
@@ -41,9 +45,9 @@ int WATER_VOLUME_TOMATO_1 = 100;
 int WATER_VOLUME_TOMATO_2 = 100;
 int WATER_VOLUME_CUCUMBER = 100;
 
-const char* ssid = "MTSRouter_62DC";
-const char* password = "42696780";
-const char* botToken = "8164448899:AAEZa2HOqIIOiRKqvYl8QiRs1zuAFXxFv_g";
+const char* ssid = "***********";
+const char* password = "********";
+const char* botToken = "*****************************";  // добавьте сюда свой токен
 const char* CHAT_ID = "5386616268";
 const int ledPin = 2;
 
@@ -947,9 +951,9 @@ void setup() {
   digitalWrite(PIN_PUMP_TOMATO_2, LOW);
   pinMode(PIN_PUMP_CUCUMBER, OUTPUT);
   digitalWrite(PIN_PUMP_CUCUMBER, LOW);
-  pinMode(36, INPUT);
-  pinMode(39, INPUT);
-  pinMode(34, INPUT);
+  pinMode(sensor_pin_1, INPUT);
+  pinMode(sensor_pin_2, INPUT);
+  pinMode(sensor_pin_3, INPUT);
   
   EEPROM.begin(512);
   
