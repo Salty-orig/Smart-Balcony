@@ -23,41 +23,51 @@
     \|__|/               \|__|\|__|   |\_________\
 .                                     \|_________|
 */                                                     
-                                              
+
 #define PIN_PUMP_TOMATO_1 14
 #define PIN_PUMP_TOMATO_2 13
 #define PIN_PUMP_CUCUMBER 12
 
-#define sensor_pin_1 34
-#define sensor_pin_1 35
-#define sensor_pin_1 36
-
 #define smart 1
 #define automatic 0
 
-// Инициализация порогов влажности
-int HUMIDITY_THRESHOLD_TOMATO_1 = 2500;
-int HUMIDITY_THRESHOLD_TOMATO_2 = 2500;
-int HUMIDITY_THRESHOLD_CUCUMBER = 2500;
+#define EEPROM_UPDATE_ID_ADDR 500  // Адрес для сохранения lastProcessedUpdateId
+
+// Калибровочные параметры для каждого датчика
+struct SensorCalibration {
+  int airValue;
+  int waterValue;
+};
+
+bool i = false;
+
+// Инициализация порогов влажности (в процентах)
+int HUMIDITY_THRESHOLD_TOMATO_1 = 30;  // 30%
+int HUMIDITY_THRESHOLD_TOMATO_2 = 30;  // 30%
+int HUMIDITY_THRESHOLD_CUCUMBER = 30;  // 30%
 
 // Инициализация объемов воды
 int WATER_VOLUME_TOMATO_1 = 100;
 int WATER_VOLUME_TOMATO_2 = 100;
 int WATER_VOLUME_CUCUMBER = 100;
 
-const char* ssid = "***********";
-const char* password = "********";
-const char* botToken = "*****************************";  // добавьте сюда свой токен
-const char* CHAT_ID = "5386616268";
+// Калибровка для каждого датчика
+SensorCalibration calibT1 = {2500, 1000};
+SensorCalibration calibT2 = {2500, 1000};
+SensorCalibration calibC = {2500, 1000};
+
+const char* ssid = "************";
+const char* password = "*********";
+const char* botToken = "***********:***********************";
+const char* CHAT_ID = "***********";
 const int ledPin = 2;
 
 // Глобальные переменные
-int dump_T1, dump_T2, dump_C;
+int humidityT1, humidityT2, humidityC;  // В процентах!
 bool t1, t2, c; 
 bool totalERROR;
 uint8_t error;
 bool mode = automatic;
-bool wateredToday[7] = {false};
 
 // Структура времени
 typedef struct {
@@ -98,6 +108,8 @@ const char* DAY_SHORT[7] = {"sun", "mon", "tue", "wed", "thu", "fri", "sat"};
 unsigned long timing = 0;
 const long serialInterval = 1000;
 const long wifiTimeout = 10000;
+const long sensorUpdateInterval = 5000;
+unsigned long lastSensorUpdate = 0;
 
 enum WateringState { 
   WATERING_IDLE, 
@@ -119,12 +131,22 @@ struct {
 WateringState wateringState = WATERING_IDLE;
 unsigned long wateringStartTime = 0;
 
+// Структура для флагов полива
+struct WateredFlags {
+  bool cucumber = false;
+  bool tomato1 = false;
+  bool tomato2 = false;
+};
+
+WateredFlags wateredToday[7]; // Флаги полива для каждого дня недели
+
 WiFiClientSecure client;
 UniversalTelegramBot bot(botToken, client);
 
 // Прототипы функций
 void printSchedule();
-void sensorChec();
+void updateSensors();
+int rawToPercent(int raw, const SensorCalibration& calib);
 void startWatering();
 void handleWatering();
 void checkWateringSchedule();
@@ -132,9 +154,13 @@ void handleSetSchedule(String chat_id, String command);
 void handleSetTimeCommand(String chat_id, String command);
 void handleSetHumidity(String chat_id, String text);
 void handleSetVolume(String chat_id, String text);
+void handleSetCalibration(String chat_id, String text);
 void handleScheduleWatering();
 void sendWateringNotification(const String& plant, int volume, int humidityBefore, int humidityAfter);
-void resetWateringFlags();
+void resetWateringFlagsForDay(uint8_t day);
+
+// Состояние последнего обработанного сообщения
+unsigned long lastProcessedUpdateId = 0; // Сохраняется при перезагрузке
 
 String formatTime(uint8_t hours, uint8_t minutes) {
   char buf[6];
@@ -162,8 +188,11 @@ void updateTime() {
   currentTime.hours = hours;
   currentTime.minutes = minutes;
 
-  if (hours == 0 && minutes == 0) {
-    resetWateringFlags();
+  // Сброс флагов полива при наступлении нового дня (в 00:00)
+  static uint8_t lastDay = 255;
+  if (currentTime.wday != lastDay) {
+    resetWateringFlagsForDay(currentTime.wday);
+    lastDay = currentTime.wday;
   }
 }
 
@@ -217,7 +246,7 @@ void handleSetTimeCommand(String chat_id, String command) {
   baseTime.hours = hours;
   baseTime.minutes = minutes;
   baseMillis = millis();
-  resetWateringFlags();
+  resetWateringFlagsForDay(wday);
   
   String message = "⏱ Время установлено!\n";
   message += "День: " + String(DAY_NAMES[wday]) + "\n";
@@ -321,26 +350,30 @@ void handleSetSchedule(String chat_id, String command) {
   }
   
   int addr = eepromOffset + dayIndex * sizeof(int);
-  EEPROM.put(addr, hourValue);
-  EEPROM.commit();
-  
-  String message = "✅ Расписание обновлено!\n";
-  message += "Растение: " + plantName + "\n";
-  message += "День: " + String(DAY_NAMES[dayIndex]) + "\n";
-  message += "Час полива: ";
-  
-  if (hourValue >= 0) {
-    message += formatTime(hourValue, 0);
-  } else {
-    message += "отключено";
+  if (EEPROM.put(addr, hourValue)) {
+    if (EEPROM.commit()) {
+      String message = "✅ Расписание обновлено!\n";
+      message += "Растение: " + plantName + "\n";
+      message += "День: " + String(DAY_NAMES[dayIndex]) + "\n";
+      message += "Час полива: ";
+      
+      if (hourValue >= 0) {
+        message += formatTime(hourValue, 0);
+      } else {
+        message += "отключено";
+      }
+      
+      bot.sendMessage(chat_id, message, "");
+      printSchedule();
+      return;
+    }
   }
   
-  bot.sendMessage(chat_id, message, "");
-  printSchedule();
+  bot.sendMessage(chat_id, "❌ Ошибка записи в EEPROM!", "");
 }
 
 void checkWateringSchedule() {
-  if (currentTime.minutes != 0 || scheduleWatering.active || wateredToday[currentTime.wday]) {
+  if (currentTime.minutes != 0 || scheduleWatering.active) {
     return;
   }
 
@@ -361,18 +394,22 @@ void checkWateringSchedule() {
     case 6: wateringHourCucumber = scheduleCucumber.sat; break;
   }
   
-  if (wateringHourCucumber >= 0 && currentTime.hours == wateringHourCucumber) {
+  if (wateringHourCucumber >= 0 && 
+      currentTime.hours == wateringHourCucumber &&
+      !wateredToday[currentTime.wday].cucumber) {
+    
     if (mode == automatic) {
       needWaterCucumber = true;
       plantsToWater += "огурцы 🥒, ";
+      wateredToday[currentTime.wday].cucumber = true;
     } else if (mode == smart) {
-      sensorChec();
-      if (dump_C > HUMIDITY_THRESHOLD_CUCUMBER) {
+      if (humidityC < HUMIDITY_THRESHOLD_CUCUMBER) {
         needWaterCucumber = true;
         plantsToWater += "огурцы 🥒, ";
+        wateredToday[currentTime.wday].cucumber = true;
       } else {
         String message = "💧 Автополив пропущен: огурцы 🥒\n";
-        message += "Причина: достаточная влажность\n";
+        message += "Причина: достаточная влажность (" + String(humidityC) + "%)\n";
         message += "День: " + String(DAY_NAMES[currentTime.wday]) + "\n";
         message += "Время: " + formatTime(currentTime.hours, currentTime.minutes);
         bot.sendMessage(CHAT_ID, message, "");
@@ -392,18 +429,22 @@ void checkWateringSchedule() {
     case 6: wateringHourTomato1 = scheduleTomato1.sat; break;
   }
   
-  if (wateringHourTomato1 >= 0 && currentTime.hours == wateringHourTomato1) {
+  if (wateringHourTomato1 >= 0 && 
+      currentTime.hours == wateringHourTomato1 &&
+      !wateredToday[currentTime.wday].tomato1) {
+    
     if (mode == automatic) {
       needWaterTomato1 = true;
       plantsToWater += "помидоры 1 🍅, ";
+      wateredToday[currentTime.wday].tomato1 = true;
     } else if (mode == smart) {
-      sensorChec();
-      if (dump_T1 > HUMIDITY_THRESHOLD_TOMATO_1) {
+      if (humidityT1 < HUMIDITY_THRESHOLD_TOMATO_1) {
         needWaterTomato1 = true;
         plantsToWater += "помидоры 1 🍅, ";
+        wateredToday[currentTime.wday].tomato1 = true;
       } else {
         String message = "💧 Автополив пропущен: помидоры 1 🍅\n";
-        message += "Причина: достаточная влажность\n";
+        message += "Причина: достаточная влажность (" + String(humidityT1) + "%)\n";
         message += "День: " + String(DAY_NAMES[currentTime.wday]) + "\n";
         message += "Время: " + formatTime(currentTime.hours, currentTime.minutes);
         bot.sendMessage(CHAT_ID, message, "");
@@ -423,18 +464,22 @@ void checkWateringSchedule() {
     case 6: wateringHourTomato2 = scheduleTomato2.sat; break;
   }
   
-  if (wateringHourTomato2 >= 0 && currentTime.hours == wateringHourTomato2) {
+  if (wateringHourTomato2 >= 0 && 
+      currentTime.hours == wateringHourTomato2 &&
+      !wateredToday[currentTime.wday].tomato2) {
+    
     if (mode == automatic) {
       needWaterTomato2 = true;
       plantsToWater += "помидоры 2 🍅, ";
+      wateredToday[currentTime.wday].tomato2 = true;
     } else if (mode == smart) {
-      sensorChec();
-      if (dump_T2 > HUMIDITY_THRESHOLD_TOMATO_2) {
+      if (humidityT2 < HUMIDITY_THRESHOLD_TOMATO_2) {
         needWaterTomato2 = true;
         plantsToWater += "помидоры 2 🍅, ";
+        wateredToday[currentTime.wday].tomato2 = true;
       } else {
         String message = "💧 Автополив пропущен: помидоры 2 🍅\n";
-        message += "Причина: достаточная влажность\n";
+        message += "Причина: достаточная влажность (" + String(humidityT2) + "%)\n";
         message += "День: " + String(DAY_NAMES[currentTime.wday]) + "\n";
         message += "Время: " + formatTime(currentTime.hours, currentTime.minutes);
         bot.sendMessage(CHAT_ID, message, "");
@@ -472,9 +517,9 @@ void handleScheduleWatering() {
     else if (currentMillis - scheduleWatering.startTimeCucumber >= (unsigned long)(WATER_VOLUME_CUCUMBER * 30)) {
       digitalWrite(PIN_PUMP_CUCUMBER, LOW);
       scheduleWatering.wateringCucumber = false;
-      int humidityBefore = dump_C;
-      sensorChec();
-      sendWateringNotification("огурцов 🥒", WATER_VOLUME_CUCUMBER, humidityBefore, dump_C);
+      int humidityBefore = humidityC;
+      updateSensors();
+      sendWateringNotification("огурцов 🥒", WATER_VOLUME_CUCUMBER, humidityBefore, humidityC);
     } else {
       allCompleted = false;
     }
@@ -488,9 +533,9 @@ void handleScheduleWatering() {
     else if (currentMillis - scheduleWatering.startTimeTomato1 >= (unsigned long)(WATER_VOLUME_TOMATO_1 * 30)) {
       digitalWrite(PIN_PUMP_TOMATO_1, LOW);
       scheduleWatering.wateringTomato1 = false;
-      int humidityBefore = dump_T1;
-      sensorChec();
-      sendWateringNotification("помидоров 1 🍅", WATER_VOLUME_TOMATO_1, humidityBefore, dump_T1);
+      int humidityBefore = humidityT1;
+      updateSensors();
+      sendWateringNotification("помидоров 1 🍅", WATER_VOLUME_TOMATO_1, humidityBefore, humidityT1);
     } else {
       allCompleted = false;
     }
@@ -504,9 +549,9 @@ void handleScheduleWatering() {
     else if (currentMillis - scheduleWatering.startTimeTomato2 >= (unsigned long)(WATER_VOLUME_TOMATO_2 * 30)) {
       digitalWrite(PIN_PUMP_TOMATO_2, LOW);
       scheduleWatering.wateringTomato2 = false;
-      int humidityBefore = dump_T2;
-      sensorChec();
-      sendWateringNotification("помидоров 2 🍅", WATER_VOLUME_TOMATO_2, humidityBefore, dump_T2);
+      int humidityBefore = humidityT2;
+      updateSensors();
+      sendWateringNotification("помидоров 2 🍅", WATER_VOLUME_TOMATO_2, humidityBefore, humidityT2);
     } else {
       allCompleted = false;
     }
@@ -517,15 +562,14 @@ void handleScheduleWatering() {
       !scheduleWatering.wateringTomato1 && 
       !scheduleWatering.wateringTomato2) {
     scheduleWatering.active = false;
-    wateredToday[currentTime.wday] = true;
   }
 }
 
 void sendWateringNotification(const String& plant, int volume, int humidityBefore, int humidityAfter) {
   String message = "✅ Полив " + plant + " завершен!\n";
   message += "Вылито: " + String(volume) + " мл\n";
-  message += "Влажность до: " + String(humidityBefore) + "\n";
-  message += "Влажность после: " + String(humidityAfter);
+  message += "Влажность до: " + String(humidityBefore) + "%\n";
+  message += "Влажность после: " + String(humidityAfter) + "%";
   bot.sendMessage(CHAT_ID, message, "");
 }
 
@@ -651,10 +695,31 @@ void printSchedule() {
   Serial.println("-------------------------\n");
 }
 
-void sensorChec(){
-  dump_T1 = analogRead(39);
-  dump_T2 = analogRead(34);
-  dump_C = analogRead(36);
+// Преобразование сырого значения в проценты
+int rawToPercent(int raw, const SensorCalibration& calib) {
+  // Ограничиваем значения в калибровочном диапазоне
+  if (raw >= calib.airValue) return 0;
+  if (raw <= calib.waterValue) return 100;
+  
+  // Преобразуем в проценты
+  return map(raw, calib.airValue, calib.waterValue, 0, 100);
+}
+
+// Обновление показаний датчиков с усреднением
+void updateSensors() {
+  const int numReadings = 5;
+  int sumT1 = 0, sumT2 = 0, sumC = 0;
+  
+  for (int i = 0; i < numReadings; i++) {
+    sumT1 += analogRead(39);
+    sumT2 += analogRead(34);
+    sumC += analogRead(36);
+    delay(10);  // Короткая задержка между чтениями
+  }
+  
+  humidityT1 = rawToPercent(sumT1 / numReadings, calibT1);
+  humidityT2 = rawToPercent(sumT2 / numReadings, calibT2);
+  humidityC = rawToPercent(sumC / numReadings, calibC);
 }
 
 void handleSetHumidity(String chat_id, String text) {
@@ -664,8 +729,8 @@ void handleSetHumidity(String chat_id, String text) {
   if (firstSpace == -1 || secondSpace == -1) {
     bot.sendMessage(chat_id, "❌ Формат: /sethumidity [растение] [порог]\n"
                     "Растения: cucumber, tomato1, tomato2\n"
-                    "Порог: 0-4095\n"
-                    "Пример: /sethumidity tomato1 2000", "");
+                    "Порог: 0-100 (%)\n"
+                    "Пример: /sethumidity tomato1 30", "");
     return;
   }
   
@@ -674,32 +739,35 @@ void handleSetHumidity(String chat_id, String text) {
   String thresholdStr = text.substring(secondSpace + 1);
   int threshold = thresholdStr.toInt();
   
-  if (threshold < 0 || threshold > 4095) {
-    bot.sendMessage(chat_id, "❌ Недопустимое значение порога! Допустимый диапазон: 0-4095", "");
+  if (threshold < 0 || threshold > 100) {
+    bot.sendMessage(chat_id, "❌ Недопустимое значение порога! Допустимый диапазон: 0-100%", "");
     return;
   }
   
+  int addr;
   if (plant == "cucumber") {
     HUMIDITY_THRESHOLD_CUCUMBER = threshold;
-    EEPROM.put(400, threshold);
-    bot.sendMessage(chat_id, "✅ Порог для огурцов установлен: " + String(threshold), "");
+    addr = 400;
   } 
   else if (plant == "tomato1") {
     HUMIDITY_THRESHOLD_TOMATO_1 = threshold;
-    EEPROM.put(404, threshold);
-    bot.sendMessage(chat_id, "✅ Порог для помидоров 1 установлен: " + String(threshold), "");
+    addr = 404;
   }
   else if (plant == "tomato2") {
     HUMIDITY_THRESHOLD_TOMATO_2 = threshold;
-    EEPROM.put(408, threshold);
-    bot.sendMessage(chat_id, "✅ Порог для помидоров 2 установлен: " + String(threshold), "");
+    addr = 408;
   }
   else {
     bot.sendMessage(chat_id, "❌ Неверное название растения! Допустимые значения: cucumber, tomato1, tomato2", "");
     return;
   }
   
-  EEPROM.commit();
+  EEPROM.put(addr, threshold);
+  if (EEPROM.commit()) {
+    bot.sendMessage(chat_id, "✅ Порог для " + plant + " установлен: " + String(threshold) + "%", "");
+  } else {
+    bot.sendMessage(chat_id, "❌ Ошибка записи в EEPROM!", "");
+  }
 }
 
 void handleSetVolume(String chat_id, String text) {
@@ -724,39 +792,102 @@ void handleSetVolume(String chat_id, String text) {
     return;
   }
   
+  int addr;
   if (plant == "cucumber") {
     WATER_VOLUME_CUCUMBER = volume;
-    EEPROM.put(412, volume);
-    bot.sendMessage(chat_id, "✅ Объем для огурцов установлен: " + String(volume) + " мл", "");
+    addr = 412;
   } 
   else if (plant == "tomato1") {
     WATER_VOLUME_TOMATO_1 = volume;
-    EEPROM.put(416, volume);
-    bot.sendMessage(chat_id, "✅ Объем для помидоров 1 установлен: " + String(volume) + " мл", "");
+    addr = 416;
   }
   else if (plant == "tomato2") {
     WATER_VOLUME_TOMATO_2 = volume;
-    EEPROM.put(420, volume);
-    bot.sendMessage(chat_id, "✅ Объем для помидоров 2 установлен: " + String(volume) + " мл", "");
+    addr = 420;
   }
   else {
     bot.sendMessage(chat_id, "❌ Неверное название растения! Допустимые значения: cucumber, tomato1, tomato2", "");
     return;
   }
   
-  EEPROM.commit();
+  EEPROM.put(addr, volume);
+  if (EEPROM.commit()) {
+    bot.sendMessage(chat_id, "✅ Объем для " + plant + " установлен: " + String(volume) + " мл", "");
+  } else {
+    bot.sendMessage(chat_id, "❌ Ошибка записи в EEPROM!", "");
+  }
 }
 
-void resetWateringFlags() {
-  for (int i = 0; i < 7; i++) {
-    wateredToday[i] = false;
+void handleSetCalibration(String chat_id, String text) {
+  int firstSpace = text.indexOf(' ');
+  int secondSpace = text.indexOf(' ', firstSpace + 1);
+  int thirdSpace = text.indexOf(' ', secondSpace + 1);
+  
+  if (firstSpace == -1 || secondSpace == -1 || thirdSpace == -1) {
+    bot.sendMessage(chat_id, "❌ Формат: /setcalib [растение] [воздух] [вода]\n"
+                    "Растения: cucumber, tomato1, tomato2\n"
+                    "Пример: /setcalib tomato1 2500 1000", "");
+    return;
+  }
+  
+  String plant = text.substring(firstSpace + 1, secondSpace);
+  plant.toLowerCase();
+  int airValue = text.substring(secondSpace + 1, thirdSpace).toInt();
+  int waterValue = text.substring(thirdSpace + 1).toInt();
+  
+  int addr1, addr2;
+  if (plant == "cucumber") {
+    calibC = {airValue, waterValue};
+    addr1 = 424;
+    addr2 = 428;
+  } 
+  else if (plant == "tomato1") {
+    calibT1 = {airValue, waterValue};
+    addr1 = 432;
+    addr2 = 436;
+  }
+  else if (plant == "tomato2") {
+    calibT2 = {airValue, waterValue};
+    addr1 = 440;
+    addr2 = 444;
+  }
+  else {
+    bot.sendMessage(chat_id, "❌ Неверное название растения! Допустимые значения: cucumber, tomato1, tomato2", "");
+    return;
+  }
+  
+  EEPROM.put(addr1, airValue);
+  EEPROM.put(addr2, waterValue);
+  if (EEPROM.commit()) {
+    bot.sendMessage(chat_id, "✅ Калибровка " + plant + " установлена!\nВоздух: " + String(airValue) + "\nВода: " + String(waterValue), "");
+    updateSensors();
+  } else {
+    bot.sendMessage(chat_id, "❌ Ошибка записи в EEPROM!", "");
+  }
+}
+
+void resetWateringFlagsForDay(uint8_t day) {
+  if (day < 7) {
+    wateredToday[day].cucumber = false;
+    wateredToday[day].tomato1 = false;
+    wateredToday[day].tomato2 = false;
+    Serial.println("Флаги полива сброшены для дня: " + String(DAY_NAMES[day]));
   }
 }
 
 void handleNewMessages(int numNewMessages) {
+  // Ограничиваем количество обрабатываемых сообщений для стабильности
+  if (numNewMessages > 20) numNewMessages = 20;
+  
   for(int i = 0; i < numNewMessages; i++) {
     String chat_id = String(bot.messages[i].chat_id);
     String text = bot.messages[i].text;
+    unsigned long update_id = bot.messages[i].update_id;
+
+
+    
+    // Обновляем ID последнего обработанного сообщения
+    lastProcessedUpdateId = update_id;
 
     if(text == "/start") {
       String welcome = "🌱 *Привет! Я бот для управления системой автополива* 🍀\n";
@@ -780,16 +911,17 @@ void handleNewMessages(int numNewMessages) {
       commands += "/setschedule - Установка расписания 📅\n";
       commands += "/getschedule - Показать расписание 📋\n";
       commands += "/sethumidity - Установка порога влажности 💧\n";
-      commands += "/setvolume - Установка объема воды 💦";
+      commands += "/setvolume - Установка объема воды 💦\n";
+      commands += "/setcalib - Калибровка датчика ⚙️";
       bot.sendMessage(chat_id, commands, "Markdown");
     }
     else if(text == "/sensors_chek") {
       digitalWrite(ledPin, HIGH);
       bot.sendMessage(chat_id, "🔄 *Проверка датчиков* 🔄", "Markdown");
-      sensorChec();
-      String sensorData = "Датчик T1: " + String(dump_T1) + "\n";
-      sensorData += "Датчик T2: " + String(dump_T2) + "\n";
-      sensorData += "Датчик C: " + String(dump_C);
+      updateSensors();
+      String sensorData = "Датчик T1: " + String(humidityT1) + "%\n";
+      sensorData += "Датчик T2: " + String(humidityT2) + "%\n";
+      sensorData += "Датчик C: " + String(humidityC) + "%";
       bot.sendMessage(chat_id, sensorData, "");
       digitalWrite(ledPin, LOW);
     }
@@ -917,8 +1049,17 @@ void handleNewMessages(int numNewMessages) {
     else if(text.startsWith("/setvolume")) {
       handleSetVolume(chat_id, text);
     }
+    else if(text.startsWith("/setcalib")) {
+      handleSetCalibration(chat_id, text);
+    }
     else if(text == "/restart"){
-      bot.sendMessage(chat_id, "🔄*Перезапуск not!*🔄", "Markdown");
+      // Сохраняем текущий ID сообщения перед перезагрузкой
+      EEPROM.put(EEPROM_UPDATE_ID_ADDR, bot.last_message_received);
+      EEPROM.commit();
+      
+      bot.sendMessage(chat_id, "🔄*Перезапуск системы!*🔄", "Markdown");
+      delay(2000);  // Даем время на отправку сообщения
+      ESP.restart();
     }else{
       bot.sendMessage(chat_id, "❌ *Неизвестная команда.* Используйте /commands для списка команд", "Markdown");
     }
@@ -930,19 +1071,7 @@ RTC_DATA_ATTR bool firstBoot = true;
 
 void setup() {
   Serial.begin(115200);
-  
-  // Однократная перезагрузка при включении питания
-  if (esp_reset_reason() == ESP_RST_POWERON) {
-    firstBoot = false;
-    Serial.println("Первая загрузка после подачи питания. Перезагрузка...");
-    delay(100);
-    ESP.restart();
-    return;
-  }
-  firstBoot = false;
 
-  Serial.println("Нормальный запуск");
-  
   // Инициализация пинов
   pinMode(ledPin, OUTPUT);
   pinMode(PIN_PUMP_TOMATO_1, OUTPUT);
@@ -951,13 +1080,26 @@ void setup() {
   digitalWrite(PIN_PUMP_TOMATO_2, LOW);
   pinMode(PIN_PUMP_CUCUMBER, OUTPUT);
   digitalWrite(PIN_PUMP_CUCUMBER, LOW);
-  pinMode(sensor_pin_1, INPUT);
-  pinMode(sensor_pin_2, INPUT);
-  pinMode(sensor_pin_3, INPUT);
+  
+  // Стабилизация питания датчиков
+  pinMode(36, INPUT_PULLUP);
+  pinMode(39, INPUT_PULLUP);
+  pinMode(34, INPUT_PULLUP);
+  delay(100); // Стабилизация питания
+  
+  // Настройка АЦП для емкостных датчиков
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
   
   EEPROM.begin(512);
   
-  int initFlagAddr = 300;
+  // Загрузка последнего обработанного ID сообщения
+  EEPROM.get(EEPROM_UPDATE_ID_ADDR, bot.last_message_received);
+
+  // После загрузки lastProcessedUpdateId из EEPROM
+  bot.last_message_received = lastProcessedUpdateId; // Синхронизация
+
+  int initFlagAddr = 300;   
   if (EEPROM.read(initFlagAddr) != 0xAA) {
     Serial.println("Инициализация EEPROM...");
     
@@ -967,17 +1109,38 @@ void setup() {
       EEPROM.put(200 + i*sizeof(int), -1);
     }
     
-    EEPROM.put(400, 2500);
-    EEPROM.put(404, 2500);
-    EEPROM.put(408, 2500);
+    // Пороги влажности в процентах
+    EEPROM.put(400, 30);
+    EEPROM.put(404, 30);
+    EEPROM.put(408, 30);
+    
+    // Объемы воды
     EEPROM.put(412, 100);
     EEPROM.put(416, 100);
     EEPROM.put(420, 100);
     
-    EEPROM.write(initFlagAddr, 0xAA);
-    EEPROM.commit();
+    // Калибровочные значения
+    EEPROM.put(424, 2500); // AIR_C
+    EEPROM.put(428, 1000); // WATER_C
+    EEPROM.put(432, 2500); // AIR_T1
+    EEPROM.put(436, 1000); // WATER_T1
+    EEPROM.put(440, 2500); // AIR_T2
+    EEPROM.put(444, 1000); // WATER_T2
+
+    // Инициализация ID сообщения
+    unsigned long initUpdateId = 0;
+    EEPROM.put(EEPROM_UPDATE_ID_ADDR, initUpdateId);
+    
+    if (EEPROM.commit()) {
+      EEPROM.write(initFlagAddr, 0xAA);
+      EEPROM.commit();
+      Serial.println("EEPROM инициализирован");
+    } else {
+      Serial.println("Ошибка инициализации EEPROM!");
+    }
   }
 
+  // Загрузка настроек из EEPROM
   EEPROM.get(400, HUMIDITY_THRESHOLD_CUCUMBER);
   EEPROM.get(404, HUMIDITY_THRESHOLD_TOMATO_1);
   EEPROM.get(408, HUMIDITY_THRESHOLD_TOMATO_2);
@@ -985,6 +1148,15 @@ void setup() {
   EEPROM.get(416, WATER_VOLUME_TOMATO_1);
   EEPROM.get(420, WATER_VOLUME_TOMATO_2);
   
+  // Загрузка калибровки
+  EEPROM.get(424, calibC.airValue);
+  EEPROM.get(428, calibC.waterValue);
+  EEPROM.get(432, calibT1.airValue);
+  EEPROM.get(436, calibT1.waterValue);
+  EEPROM.get(440, calibT2.airValue);
+  EEPROM.get(444, calibT2.waterValue);
+  
+  // Загрузка расписания
   for (int plant = 0; plant < 3; plant++) {
     int eepromOffset = plant * 100;
     for (int i = 0; i < 7; i++) {
@@ -1048,49 +1220,81 @@ void setup() {
     Serial.print(".");
     
     if(millis() - wifiStart > wifiTimeout) {
-      Serial.println("\nОшибка подключения к WiFi! Перезагрузка...");
-      delay(1000);
-      ESP.restart();
+      Serial.println("\nОшибка подключения к WiFi! Переход в автономный режим...");
+      break;
     }
   }
   
-  Serial.println("\nWiFi подключен!");
-  Serial.print("IP адрес: ");
-  Serial.println(WiFi.localIP());
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi подключен!");
+    Serial.print("IP адрес: ");
+    Serial.println(WiFi.localIP());
+    bot.sendMessage(CHAT_ID, "🌱 *Система автополива запущена!*\n⌛ Установите время командой /settime", "Markdown");
+  } else {
+    Serial.println("\nРабота в автономном режиме");
+  }
   
-  bot.sendMessage(CHAT_ID, "🌱 *Система автополива запущена!*\n⌛ Установите время командой /settime", "Markdown");
+  // Первоначальное обновление датчиков
+  updateSensors();
   printSchedule();
 }
 
 void loop() {
+  // Сброс watchdog таймера
+  yield();
+  
+  unsigned long currentMillis = millis();
+  
   updateTime();
   checkWateringSchedule();
   handleWatering();
   handleScheduleWatering();
 
-  unsigned long currentMillis = millis();
+  // Периодическое обновление датчиков
+  if(currentMillis - lastSensorUpdate >= sensorUpdateInterval) {
+    lastSensorUpdate = currentMillis;
+    updateSensors();
+  }
 
   if(currentMillis - timing >= serialInterval) {
     timing = currentMillis;
     Serial.printf("Время работы: %.1f сек.\n", currentMillis / 1000.0);
     
     if(WiFi.status() != WL_CONNECTED) {
-      Serial.println("Потеряно соединение WiFi!");
+      Serial.println("Потеряно соединение WiFi! Попытка переподключения...");
+      WiFi.reconnect();
     }
 
-    sensorChec();
+
     Serial.print("T1: ");
-    Serial.print(dump_T1);
+    Serial.print(analogRead(39));
     Serial.print(" | T2: ");
-    Serial.print(dump_T2);
+    Serial.print(analogRead(34));
     Serial.print(" | C: ");
-    Serial.println(dump_C);
+    Serial.print(analogRead(36));
+    Serial.println("");
   }
+
   
-  int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
-  if(numNewMessages > 0) {
-    handleNewMessages(numNewMessages);
+  if (WiFi.status() == WL_CONNECTED) {
+    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    Serial.println("Last processed ID: " + String(bot.last_message_received));
+    Serial.println("New messages: " + String(numNewMessages));
+    if(numNewMessages > 0 && i) {
+      handleNewMessages(numNewMessages);
+    }else{i = true;}
   }
+
+
+  // Периодическое сохранение ID (раз в 30 секунд)
+  static unsigned long lastSaveTime = 0;
+  if (millis() - lastSaveTime > 30000) {
+    lastSaveTime = millis();
+    EEPROM.put(EEPROM_UPDATE_ID_ADDR, bot.last_message_received);
+    EEPROM.commit();
+  }
+
   
+   
   delay(10);
 }
